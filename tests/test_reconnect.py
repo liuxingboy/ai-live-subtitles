@@ -48,6 +48,42 @@ class ReconnectTests(unittest.TestCase):
                 self.assertEqual(stop.delays, [1])
                 self.assertEqual(report['disconnects'], 1)
 
+    def test_model_repetition_event_reconnects(self):
+        detail = {'code': 'COMMON_ERROR', 'message': 'model repeat output happened'}
+        ws = Mock()
+        ws.recv_data.return_value = (
+            websocket.ABNF.OPCODE_TEXT,
+            json.dumps({'type': 'error', 'error': detail}),
+        )
+        session = Session(ws, '')
+        session.receive()
+        self.assertTrue(session.failed.is_set())
+        self.assertIsInstance(session.failure, ConnectionLost)
+        stop = FakeStop()
+        report = {}
+        calls = []
+        def attempt(_):
+            calls.append(1)
+            if len(calls) == 1:
+                session.raise_failure()
+        run_with_reconnect(attempt, stop, report, clock=lambda: stop.now)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(stop.delays, [1])
+        self.assertEqual(report['reconnect_attempts'], 1)
+
+    def test_unknown_common_error_remains_terminal(self):
+        for code, message in (
+            ('COMMON_ERROR', 'unknown service failure'),
+            ('invalid_api_key', 'model repeat output happened'),
+        ):
+            with self.subTest(code=code):
+                error = service_error({'code': code, 'message': message})
+                self.assertIsInstance(error, ServiceError)
+                stop = FakeStop()
+                with self.assertRaises(ServiceError):
+                    run_with_reconnect(Mock(side_effect=error), stop, {})
+                self.assertEqual(stop.delays, [])
+
     def test_other_asr_failures_are_not_blindly_retried(self):
         for code, message in (
             ('UNEXPECTED_ASR_ERROR', 'grpc error: statusCode=401, message=Unauthorized'),

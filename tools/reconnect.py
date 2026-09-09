@@ -24,7 +24,12 @@ def service_error(detail):
         and re.search(r'\bstatusCode\s*=\s*504\b', message, re.IGNORECASE)
         and 'response stream timeout' in message.lower()
     )
-    error_type = ConnectionLost if retryable or asr_timeout else ServiceError
+    # Observed model repetition failure: start a fresh session to recover.
+    model_repetition = (
+        code == 'common_error'
+        and message.strip().lower() == 'model repeat output happened'
+    )
+    error_type = ConnectionLost if retryable or asr_timeout or model_repetition else ServiceError
     return error_type(json.dumps(detail, ensure_ascii=False))
 
 
