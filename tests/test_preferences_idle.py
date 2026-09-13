@@ -59,7 +59,13 @@ class PreferencesTests(unittest.TestCase):
     def test_all_silence_never_opens_cloud(self):
         self._exercise([QUIET] * 20, expected_connections=0)
 
-    def _exercise(self, blocks, expected_connections):
+    def test_fast_mode_survives_idle_resume(self):
+        self._exercise([TONE] * 3 + [QUIET] * 4 + [TONE] * 4, expected_connections=2, speed='fast')
+
+    def test_target_language_survives_idle_resume(self):
+        self._exercise([TONE] * 3 + [QUIET] * 4 + [TONE] * 4, expected_connections=2, speed='fast', target_language='ja')
+
+    def _exercise(self, blocks, expected_connections, speed='normal', target_language='zh'):
         queue = PCMQueue(200, drop_oldest=True)
         for block in blocks:
             queue.put(block)
@@ -86,15 +92,23 @@ class PreferencesTests(unittest.TestCase):
             def finish(self):
                 self.finish_calls += 1
                 self.finished.set()
-        args = SimpleNamespace(silence_seconds=.3, silence_db=-55, on_state=None, on_event=None, partial=False, hotwords={'retake': '回防'})
+        args = SimpleNamespace(silence_seconds=.3, silence_db=-55, on_state=None, on_event=None, partial=False, hotwords={'retake': '回防'}, speed=speed, target_language=target_language)
         report = {}
-        with patch('tools.idle_translate.ChromeAudioSource', return_value=source), patch('tools.idle_translate.Session', FakeSession), patch('tools.idle_translate.websocket.create_connection') as connect:
-            run_idle_attempt(None, 'fake-key', 'wss://example.invalid', args, 3, threading.Event(), report)
+        target = SimpleNamespace(label='测试声源', create=Mock(return_value=source))
+        with patch('tools.idle_translate.Session', FakeSession), patch('tools.idle_translate.websocket.create_connection') as connect:
+            run_idle_attempt(target, 'fake-key', 'wss://example.invalid', args, 3, threading.Event(), report)
         self.assertEqual(connect.call_count, expected_connections)
         self.assertTrue(report['normal_finish'])
         for session in sessions:
             self.assertEqual(session.finish_calls, 1)
-            self.assertEqual(session.sent[0][1]['session']['translation']['corpus']['phrases'], args.hotwords)
+            expected_vad = {'type': 'server_vad', **({'silence_duration_ms': 300} if speed == 'fast' else {})}
+            self.assertEqual(session.sent[0][1]['session']['turn_detection'], expected_vad)
+            translation = session.sent[0][1]['session']['translation']
+            self.assertEqual(translation['language'], target_language)
+            if target_language == 'zh':
+                self.assertEqual(translation['corpus']['phrases'], args.hotwords)
+            else:
+                self.assertNotIn('corpus', translation)
         if sessions:
             import base64
             uploaded = b''.join(base64.b64decode(fields['audio']) for session in sessions for kind, fields in session.sent if kind == 'input_audio_buffer.append')

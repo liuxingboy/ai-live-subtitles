@@ -1,4 +1,4 @@
-"""Phase 2: Chrome audio -> Bailian -> bilingual terminal subtitles."""
+"""Audio source -> Bailian -> bilingual terminal subtitles."""
 import argparse
 import base64
 import json
@@ -15,8 +15,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.api_debug import Session, configure_console, connection_config, safe_error, session_config
-from audio.chrome_detector import find_chrome_processes, choose_chrome
-from audio.live_source import ChromeAudioSource
+from audio.sources import SOURCE_REGISTRY, resolve_source, SourceShutdownError
+from app.preferences import SPEED_MODES, TARGET_LANGUAGES
 from tools.reconnect import ConnectionLost, network_error, run_with_reconnect
 
 
@@ -53,7 +53,7 @@ def stream_audio(session, source, stop, report):
         if now - last_report >= 30:
             last_report = now
             print(f"[STATUS] 已发送 {uploaded / 32000:.0f}s 音频，"
-                  f"英文 {report.get('english_finals', 0) + session.english_finals} 段，中文 {report.get('chinese_finals', 0) + session.chinese_finals} 段，"
+                  f"原文 {report.get('english_finals', 0) + session.english_finals} 段，译文 {report.get('chinese_finals', 0) + session.chinese_finals} 段，"
                   f"重连 {report.get('reconnect_attempts', 0)} 次，"
                   f"待发送 {source.audio.queue.qsize() / 10:.1f}s", flush=True)
     report["uploaded_seconds"] = round(uploaded / 32000, 3)
@@ -77,10 +77,10 @@ def run_attempt(target, key, url, args, seconds, stop, report):
         ws.settimeout(1)
         if args.on_event:
             args.on_event({'type': '_session_reset'})
-        session = Session(ws, key, show_partial=args.partial, on_event=args.on_event)
+        session = Session(ws, key, show_partial=args.partial, on_event=args.on_event, target_language=getattr(args, 'target_language', 'zh'))
         session.reader.start()
         try:
-            session.send('session.update', session=session_config(args.hotwords))
+            session.send('session.update', session=session_config(args.hotwords, speed=getattr(args, 'speed', 'normal'), target_language=getattr(args, 'target_language', 'zh')))
         except Exception as exc:
             raise network_error(exc) from exc
         try:
@@ -93,10 +93,10 @@ def run_attempt(target, key, url, args, seconds, stop, report):
             report['normal_finish'] = True
             return
         report['successful_connections'] = report.get('successful_connections', 0) + 1
-        print('[CONNECTED] Chrome 音频上传已就绪；Ctrl+C 结束。', flush=True)
+        print(f'[CONNECTED] {target.label}音频上传已就绪；Ctrl+C 结束。', flush=True)
         if args.on_state:
             args.on_state('connected', '已连接 · 等待语音')
-        source = ChromeAudioSource(target, remaining)
+        source = target.create(remaining)
         stream_audio(session, source, stop, report)
         try:
             session.finish()
@@ -136,17 +136,20 @@ def run_attempt(target, key, url, args, seconds, stop, report):
             if session.close_code is not None:
                 report['last_close_code'] = session.close_code
         if thread_stuck:
-            raise RuntimeError('音频线程未及时退出，不能安全重启捕获。')
+            raise SourceShutdownError('音频线程未及时退出，不能安全重启捕获。')
 
 
 def main(argv=None, stop_event=None, on_event=None, on_state=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--target-language', choices=tuple(TARGET_LANGUAGES), default='zh', help='翻译目标语言，默认 zh 中文')
+    parser.add_argument('--speed', choices=tuple(SPEED_MODES), default='normal', help='速度与准度：normal 正常 / fast 速度优先')
+    parser.add_argument('--source', choices=tuple(SOURCE_REGISTRY), default='chrome', help='声源：chrome / system / microphone')
     parser.add_argument('--pid', type=int, help='指定 Chrome PID')
     parser.add_argument('--seconds', type=float, help='限时运行秒数（包括重连等待）；默认到 Ctrl+C')
     parser.add_argument('--silence-seconds', type=float, default=30, help='静音多久暂停云端，默认 30 秒；0 禁用')
     parser.add_argument('--silence-db', type=float, default=-55, help='静音阈值 dBFS，默认 -55')
-    parser.add_argument('--hotwords', type=Path, default=ROOT / 'config/hotwords/cs2.json', help='术语 JSON 路径')
-    parser.add_argument('--no-hotwords', action='store_true', help='关闭电竞术语词库')
+    parser.add_argument('--hotwords', type=Path, default=ROOT / 'config/hotwords/python.json', help='术语 JSON 路径（默认 Python 教学词库）')
+    parser.add_argument('--no-hotwords', action='store_true', help='关闭术语词库')
     display = parser.add_mutually_exclusive_group()
     display.add_argument('--partial', action='store_true', help='终端也打印流式临时结果（悬浮窗默认已显示）')
     display.add_argument('--final-only', action='store_true', help='悬浮窗仅显示最终结果，更稳定但等待更久')
@@ -170,15 +173,22 @@ def main(argv=None, stop_event=None, on_event=None, on_state=None):
               'disconnects': 0, 'reconnect_attempts': 0}
     try:
         from dotenv import load_dotenv
-        from audio.chrome_detector import still_running
         load_dotenv(ROOT / '.env', encoding='utf-8-sig')
         from app.preferences import load_hotwords
-        args.hotwords = load_hotwords(None if args.no_hotwords else args.hotwords)
-        print(f'[INFO] 已加载 {len(args.hotwords)} 条电竞术语；静音暂停阈值 {args.silence_seconds:g} 秒。', flush=True)
+        args.hotwords = load_hotwords(None if args.no_hotwords or args.target_language != 'zh' else args.hotwords)
+        print(f'[INFO] 已加载 {len(args.hotwords)} 条术语；静音暂停阈值 {args.silence_seconds:g} 秒。', flush=True)
+        if args.target_language != 'zh' and not args.no_hotwords:
+            print('[INFO] 非中文目标暂不应用中译热词，词库文件保留。', flush=True)
         key, url = connection_config(os.environ)
-        target = choose_chrome(find_chrome_processes(), args.pid)
-        print(f'[INFO] Chrome PID={target.pid}；自动重连已启用。', flush=True)
-        report['chrome_pid'] = target.pid
+        target = resolve_source(args.source, args.pid)
+        print(f'[INFO] 声源：{target.label}；自动重连已启用。', flush=True)
+        report['source'] = target.key
+        report['speed'] = args.speed
+        report['target_language'] = args.target_language
+        print(f'[INFO] 目标语言：{TARGET_LANGUAGES[args.target_language]}。', flush=True)
+        print(f'[INFO] 速度与准度：{SPEED_MODES[args.speed]}。', flush=True)
+        if target.pid is not None:
+            report['chrome_pid'] = target.pid
         def attempt(remaining):
             try:
                 if args.silence_seconds:
@@ -189,21 +199,21 @@ def main(argv=None, stop_event=None, on_event=None, on_state=None):
             except ConnectionLost as exc:
                 if on_state:
                     on_state('reconnecting', '连接中断 · 自动重连中')
-                raise ConnectionLost(safe_error(exc, key)) from None
-        run_with_reconnect(attempt, stop, report, args.seconds, alive=lambda: still_running(target))
+                raise type(exc)(safe_error(exc, key)) from None
+        run_with_reconnect(attempt, stop, report, args.seconds, alive=target.alive)
     except Exception as exc:
         print(f'[ERROR] {safe_error(exc, key)}', file=sys.stderr, flush=True)
         report['error_type'] = type(exc).__name__
         if on_state:
             on_state('error', safe_error(exc, key))
-        code = 1
+        code = 2 if isinstance(exc, SourceShutdownError) else 1
     finally:
         if old_signal is not None:
             signal.signal(signal.SIGINT, old_signal)
         report['elapsed_seconds'] = round(time.monotonic() - started, 2)
         if not report['normal_finish']:
             print('[WARN] 退出时没有可正常收尾的会话，最后一句可能不完整。', flush=True)
-            if not stop.is_set():
+            if not stop.is_set() and code == 0:
                 code = 1
         report['exit_code'] = code
         path = ROOT / 'logs' / 'phase2_last_run.json'
@@ -213,8 +223,8 @@ def main(argv=None, stop_event=None, on_event=None, on_state=None):
             print(f'[INFO] 运行统计：{path}', flush=True)
         except OSError:
             print('[WARN] 无法保存运行统计。', file=sys.stderr)
-        print(f"[INFO] 已发送 {report['uploaded_seconds']}s；英文 {report.get('english_finals', 0)} 段，"
-              f"中文 {report.get('chinese_finals', 0)} 段；断线 {report['disconnects']} 次，"
+        print(f"[INFO] 已发送 {report['uploaded_seconds']}s；原文 {report.get('english_finals', 0)} 段，"
+              f"译文 {report.get('chinese_finals', 0)} 段；断线 {report['disconnects']} 次，"
               f"重连尝试 {report['reconnect_attempts']} 次。", flush=True)
         if code == 0 and (not report.get('english_finals') or not report.get('chinese_finals')):
             print('[WARN] 本次未同时获得双语最终结果，请播放清晰英文验证。', flush=True)

@@ -41,29 +41,38 @@ def connection_config(environ):
     return key, f"wss://{host}/api-ws/v1/realtime?model={MODEL}"
 
 
-def session_config(hotwords=None):
-    return {
+def session_config(hotwords=None, speed='normal', target_language='zh'):
+    from app.preferences import SPEED_MODES, TARGET_LANGUAGES
+    if speed not in SPEED_MODES:
+        raise ValueError(f'未知速度模式：{speed}')
+    if target_language not in TARGET_LANGUAGES:
+        raise ValueError(f'不支持的目标语言：{target_language}')
+    config = {
         "modalities": ["text"],
         "input_audio_format": "pcm",
         "sample_rate": 16000,
         "input_audio_transcription": {
             "model": "qwen3-asr-flash-realtime", "language": "en"
         },
-        "translation": {"language": "zh", **({"corpus": {"phrases": hotwords}} if hotwords else {})},
+        "translation": {"language": target_language, **({"corpus": {"phrases": hotwords}} if hotwords and target_language == "zh" else {})},
         "turn_detection": {"type": "server_vad"},
     }
+    if speed == 'fast':
+        # Earlier VAD boundaries trade sentence context for responsiveness.
+        config['turn_detection']['silence_duration_ms'] = 300
+    return config
 
 
-def subtitle_line(event):
+def subtitle_line(event, target_language='zh'):
     """Print each partial event separately; do not assume cross-language pairing."""
     kind = event.get("type", "")
     if kind == "conversation.item.input_audio_transcription.completed":
         return f"[EN] {event.get('transcript', '')}"
     if kind == "response.text.done":
-        return f"[ZH] {event.get('text', '')}"
+        return f"[{target_language.upper()}] {event.get('text', '')}"
     language = {
         "conversation.item.input_audio_transcription.text": "EN",
-        "response.text.text": "ZH",
+        "response.text.text": target_language.upper(),
     }.get(kind)
     if language:
         return f"[{language} partial] {event.get('text', '')}{event.get('stash', '')}"
@@ -78,13 +87,14 @@ def safe_error(error, key=""):
 
 
 class Session:
-    def __init__(self, ws, key, show_partial=True, on_event=None):
+    def __init__(self, ws, key, show_partial=True, on_event=None, target_language='zh'):
         self.ws = ws
         self.key = key
         self.show_partial = show_partial
         self.on_event = on_event
+        self.target_language = target_language
         self.english_finals = 0
-        self.chinese_finals = 0
+        self.chinese_finals = 0  # Legacy counter name: counts target-language results.
         self.failure = None
         self.close_code = None
         self.last_ping = 0.0
@@ -142,7 +152,7 @@ class Session:
                     raise service_error(detail)
                 elif kind == "response.done" and event.get("response", {}).get("status") in {"failed", "incomplete"}:
                     raise ServiceError("翻译响应未完成，请检查模型权限与网络。")
-                line = subtitle_line(event)
+                line = subtitle_line(event, self.target_language)
                 if kind == "conversation.item.input_audio_transcription.completed" and event.get("transcript", "").strip():
                     self.english_finals += 1
                 if kind == "response.text.done" and event.get("text", "").strip():
