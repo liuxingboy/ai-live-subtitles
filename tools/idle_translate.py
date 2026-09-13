@@ -3,7 +3,8 @@ from collections import deque
 import base64
 import time
 import websocket
-from audio.live_source import ChromeAudioSource, PCMQueue
+from audio.live_source import PCMQueue
+from audio.sources import SourceShutdownError
 from audio.silence import ActivityDetector
 from tools.api_debug import Session, session_config
 from tools.reconnect import ConnectionLost, network_error
@@ -12,7 +13,7 @@ from tools.reconnect import ConnectionLost, network_error
 def run_idle_attempt(target, key, url, args, seconds, stop, report):
     # Buffer is bounded to 20 seconds during handshakes/finalization. On actual
     # transport failure this entire source is stopped and never reused by retry.
-    source = ChromeAudioSource(target, seconds, audio_queue=PCMQueue(200, drop_oldest=True))
+    source = target.create(seconds, audio_queue=PCMQueue(200, drop_oldest=True))
     detector = ActivityDetector(args.silence_db)
     preroll = deque(maxlen=10)  # one second, including wake-up confirmation
     ws = session = None
@@ -58,7 +59,7 @@ def run_idle_attempt(target, key, url, args, seconds, stop, report):
         report['uploaded_seconds'] = round(report['uploaded_bytes'] / 32000, 3)
 
     source.thread.start()
-    state('paused', '等待 Chrome 声音 · 云端已暂停')
+    state('paused', f'等待{target.label}声音 · 云端已暂停')
     try:
         while True:
             if stop.is_set():
@@ -92,10 +93,10 @@ def run_idle_attempt(target, key, url, args, seconds, stop, report):
                     ws.settimeout(1)
                     if args.on_event:
                         args.on_event({'type': '_session_reset'})
-                    session = Session(ws, key, show_partial=args.partial, on_event=args.on_event)
+                    session = Session(ws, key, show_partial=args.partial, on_event=args.on_event, target_language=getattr(args, 'target_language', 'zh'))
                     session.reader.start()
                     try:
-                        session.send('session.update', session=session_config(args.hotwords))
+                        session.send('session.update', session=session_config(args.hotwords, speed=getattr(args, 'speed', 'normal'), target_language=getattr(args, 'target_language', 'zh')))
                         ready = session.wait(session.ready, 15, stop)
                     except TimeoutError as exc:
                         raise ConnectionLost('等待 session.updated 超时。') from exc
@@ -139,4 +140,4 @@ def run_idle_attempt(target, key, url, args, seconds, stop, report):
                 for name in ('discontinuities', 'timestamp_errors'):
                     report[name] = report.get(name, 0) + getattr(source.result, name)
             if source.thread.is_alive():
-                raise RuntimeError('音频线程未及时退出，停止重连。')
+                raise SourceShutdownError('音频线程未及时退出，停止重连。')

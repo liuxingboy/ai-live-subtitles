@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import Mock
 import websocket
 from tools.api_debug import Session
-from tools.reconnect import ConnectionLost, ServiceError, network_error, service_error, run_with_reconnect
+from tools.reconnect import ConnectionLost, UnspecifiedASRError, ServiceError, network_error, service_error, run_with_reconnect
 
 
 class FakeStop:
@@ -83,6 +83,43 @@ class ReconnectTests(unittest.TestCase):
                 with self.assertRaises(ServiceError):
                     run_with_reconnect(Mock(side_effect=error), stop, {})
                 self.assertEqual(stop.delays, [])
+
+    def test_unspecified_asr_event_recovers(self):
+        detail = {'type': 'transcription_error', 'code': 'UNEXPECTED_ASR_ERROR'}
+        for kind in ('error', 'conversation.item.input_audio_transcription.failed'):
+            with self.subTest(kind=kind):
+                ws = Mock()
+                ws.recv_data.return_value = (websocket.ABNF.OPCODE_TEXT, json.dumps({'type': kind, 'error': detail}))
+                session = Session(ws, '')
+                session.receive()
+                self.assertIsInstance(session.failure, UnspecifiedASRError)
+                stop, report = FakeStop(), {}
+                operation = Mock(side_effect=[session.failure, None])
+                run_with_reconnect(operation, stop, report, clock=lambda: stop.now)
+                self.assertEqual(operation.call_count, 2)
+                self.assertEqual(report['asr_recovery_attempts'], 1)
+
+    def test_unspecified_asr_budget_does_not_reset_after_long_attempt(self):
+        stop, report = FakeStop(), {}
+        def fail(_):
+            stop.now += 31
+            raise UnspecifiedASRError('no details')
+        operation = Mock(side_effect=fail)
+        with self.assertRaisesRegex(ServiceError, '两次'):
+            run_with_reconnect(operation, stop, report, clock=lambda: stop.now)
+        self.assertEqual(operation.call_count, 3)
+        self.assertEqual(report['asr_recovery_attempts'], 2)
+        self.assertEqual(len(stop.delays), 2)
+
+    def test_unspecified_asr_requires_exact_diagnostic_shape(self):
+        for detail in (
+            {'code': 'UNEXPECTED_ASR_ERROR'},
+            {'type': 'transcription_error', 'code': 'UNEXPECTED_ASR_ERROR', 'message': 'Unauthorized'},
+            {'type': 'transcription_error', 'code': 'UNEXPECTED_ASR_ERROR', 'status': 401},
+            {'type': 'transcription_error', 'code': 'invalid_api_key'},
+        ):
+            with self.subTest(detail=detail):
+                self.assertIsInstance(service_error(detail), ServiceError)
 
     def test_other_asr_failures_are_not_blindly_retried(self):
         for code, message in (

@@ -8,6 +8,10 @@ class ConnectionLost(RuntimeError):
     pass
 
 
+class UnspecifiedASRError(ConnectionLost):
+    """Observed ASR failure without diagnostics; recovery has a strict budget."""
+
+
 class ServiceError(RuntimeError):
     pass
 
@@ -29,7 +33,14 @@ def service_error(detail):
         code == 'common_error'
         and message.strip().lower() == 'model repeat output happened'
     )
-    error_type = ConnectionLost if retryable or asr_timeout or model_repetition else ServiceError
+    unspecified_asr = (
+        code == 'unexpected_asr_error'
+        and detail.get('type') == 'transcription_error'
+        and (detail.get('message') is None or not message.strip())
+        and set(detail) <= {'type', 'code', 'message'}
+    )
+    error_type = (UnspecifiedASRError if unspecified_asr else
+                  ConnectionLost if retryable or asr_timeout or model_repetition else ServiceError)
     return error_type(json.dumps(detail, ensure_ascii=False))
 
 
@@ -45,6 +56,7 @@ def network_error(exc):
 def run_with_reconnect(operation, stop, report, seconds=None, alive=lambda: True, clock=time.monotonic):
     deadline = clock() + seconds if seconds is not None else None
     failures = 0
+    asr_recoveries = 0
     while not stop.is_set():
         remaining = None if deadline is None else deadline - clock()
         if remaining is not None and remaining <= 0:
@@ -59,6 +71,8 @@ def run_with_reconnect(operation, stop, report, seconds=None, alive=lambda: True
             report['disconnects'] = report.get('disconnects', 0) + 1
             if stop.is_set():
                 return
+            if isinstance(exc, UnspecifiedASRError) and asr_recoveries >= 2:
+                raise ServiceError('云端语音识别错误未提供原因，自动恢复两次后仍失败。可尝试正常模式；若仍失败请稍后重试。') from exc
             if clock() - began >= 30:
                 failures = 0
             delay = (1, 2, 4, 8, 15)[min(failures, 4)]
@@ -72,4 +86,7 @@ def run_with_reconnect(operation, stop, report, seconds=None, alive=lambda: True
                 return
             if deadline is not None and clock() >= deadline:
                 return
+            if isinstance(exc, UnspecifiedASRError):
+                asr_recoveries += 1
+                report['asr_recovery_attempts'] = asr_recoveries
             report['reconnect_attempts'] = report.get('reconnect_attempts', 0) + 1
