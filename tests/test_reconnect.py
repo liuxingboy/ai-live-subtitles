@@ -130,6 +130,35 @@ class ReconnectTests(unittest.TestCase):
             with self.subTest(code=code, message=message):
                 self.assertIsInstance(service_error({'code': code, 'message': message}), ServiceError)
 
+    def test_asr_capacity_event_retries_with_backoff(self):
+        for spelling in ('exausted', 'exhausted'):
+            for event_type in ('error', 'conversation.item.input_audio_transcription.failed'):
+                with self.subTest(spelling=spelling, event_type=event_type):
+                    detail = {'type': 'transcription_error', 'code': 'UNEXPECTED_ASR_ERROR',
+                              'message': f'grpc error: statusCode=429, message=thread pool {spelling} max_workers 100'}
+                    ws = Mock()
+                    ws.recv_data.return_value = (websocket.ABNF.OPCODE_TEXT,
+                        json.dumps({'type': event_type, 'error': detail}))
+                    session = Session(ws, '')
+                    session.receive()
+                    self.assertIsInstance(session.failure, ConnectionLost)
+                    stop, report = FakeStop(), {}
+                    operation = Mock(side_effect=[session.failure, session.failure, None])
+                    run_with_reconnect(operation, stop, report, clock=lambda: stop.now)
+                    self.assertEqual(stop.delays, [1, 2])
+                    self.assertEqual(operation.call_count, 3)
+                    self.assertEqual(report['reconnect_attempts'], 2)
+
+    def test_capacity_match_does_not_retry_unrelated_errors(self):
+        for code, message in (
+            ('UNEXPECTED_ASR_ERROR', 'statusCode=401, message=thread pool exausted'),
+            ('UNEXPECTED_ASR_ERROR', 'statusCode=429, message=quota exhausted'),
+            ('UNEXPECTED_ASR_ERROR', 'statusCode=4290, message=thread pool exausted'),
+            ('invalid_api_key', 'statusCode=429, message=thread pool exausted'),
+        ):
+            with self.subTest(code=code, message=message):
+                self.assertIsInstance(service_error({'code': code, 'message': message}), ServiceError)
+
     def test_backoff_then_recovery(self):
         stop = FakeStop()
         report = {}

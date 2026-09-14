@@ -1,7 +1,9 @@
 """Serial worker handover. Qt calls select/poll/close on its main thread."""
 import threading
+import argparse
+from pathlib import Path
 from audio.sources import SOURCE_REGISTRY
-from app.preferences import SPEED_MODES, TARGET_LANGUAGES
+from app.preferences import SPEED_MODES, TARGET_LANGUAGES, DEFAULT_HOTWORDS, add_hotword_arguments, load_hotwords
 
 
 class TranslationController:
@@ -14,6 +16,11 @@ class TranslationController:
         self.speed = speed
         self.translate = translate
         self.argv = list(argv or [])
+        parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+        add_hotword_arguments(parser)
+        options = parser.parse_known_args(self.argv)[0]
+        self.hotwords_path = options.hotwords if options.hotwords is not None else DEFAULT_HOTWORDS
+        self.hotwords_enabled = options.hotwords is not None and not options.no_hotwords
         self.on_event, self.on_state = on_event, on_state
         self.thread = None
         self.stop = threading.Event()
@@ -54,6 +61,24 @@ class TranslationController:
         self.target_language = language
         return self.select(self.selected, force=True)
 
+    def set_hotwords(self, *, enabled=None, path=None):
+        if self.closing or self.blocked:
+            return False
+        new_enabled = self.hotwords_enabled if enabled is None else bool(enabled)
+        new_path = self.hotwords_path if path is None else Path(path)
+        changed = new_enabled != self.hotwords_enabled or new_path != self.hotwords_path
+        if not changed:
+            return True
+        # Validate before stopping a working session; errors preserve both state and audio.
+        if path is not None or new_enabled:
+            load_hotwords(new_path)
+        was_active = self.hotwords_enabled and self.target_language == 'zh'
+        is_active = new_enabled and self.target_language == 'zh'
+        self.hotwords_enabled, self.hotwords_path = new_enabled, new_path
+        if was_active or is_active:
+            return self.select(self.selected, force=True)
+        return True
+
     def poll(self):
         if self.thread and self.thread.is_alive():
             return
@@ -77,12 +102,18 @@ class TranslationController:
             if skip:
                 skip = False
                 continue
-            if arg in ('--source', '--speed', '--target-language') or (key != 'chrome' and arg == '--pid'):
+            if arg in ('--source', '--speed', '--target-language', '--hotwords') or (key != 'chrome' and arg == '--pid'):
                 skip = True
                 continue
-            if arg.startswith(('--source=', '--speed=', '--target-language=')) or (key != 'chrome' and arg.startswith('--pid=')):
+            if arg.startswith(('--source=', '--speed=', '--target-language=', '--hotwords=')) or (key != 'chrome' and arg.startswith('--pid=')):
+                continue
+            if arg == '--no-hotwords':
                 continue
             cleaned.append(arg)
+        if self.hotwords_enabled:
+            cleaned += ['--hotwords', str(self.hotwords_path)]
+        else:
+            cleaned += ['--no-hotwords']
         cleaned += ['--target-language', self.target_language, '--speed', self.speed, '--source', key]
         def event(value):
             if generation == self.generation and not self.closing:

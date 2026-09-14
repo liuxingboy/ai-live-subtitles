@@ -67,7 +67,7 @@ class ChromeAudioSource:
         try:
             self.result = capture_process(self.target.pid, self.seconds, self.stop,
                                           alive=lambda: still_running(self.target),
-                                          on_audio=self.audio.put)
+                                          on_audio=self.audio.put, monitor_output=True)
             self.audio.flush()
             if self.result.discontinuities:
                 raise RuntimeError(f"捕获出现 {self.result.discontinuities} 次不连续，稳定性验证未通过。")
