@@ -21,15 +21,21 @@ def capture_endpoint(kind, seconds, stop, on_audio):
     label = '系统声音' if kind == 'system' else '系统麦克风'
     check(ole32.CoInitializeEx(None, 0), '初始化音频 COM')
     enumerator, device, client, capture = P(), P(), P(), P()
+    watcher = None
     started = False
     packets = discontinuities = timestamp_errors = 0
     began = time.monotonic()
     try:
+        if kind == 'system':
+            from audio.output_device import OutputDeviceWatcher, endpoint_id, OutputDeviceChanged
+            watcher = OutputDeviceWatcher()
         check(ole32.CoCreateInstance(C.byref(CLSID_ENUMERATOR), None, 1,
               C.byref(IID_ENUMERATOR), C.byref(enumerator)), '创建设备枚举器')
         check(method(enumerator, 4, HRESULT, C.c_int, C.c_int, C.POINTER(P))(
               enumerator, 0 if kind == 'system' else 1, 1, C.byref(device)),
               f'获取默认{label}设备，请检查 Windows 声音设置')
+        if watcher and endpoint_id(device) != watcher.original:
+            raise OutputDeviceChanged()
         check(method(device, 3, HRESULT, C.POINTER(GUID), U32, P, C.POINTER(P))(
               device, C.byref(IID_CLIENT), 1, None, C.byref(client)), f'激活{label}')
         fmt = WaveFormat(1, 1, 16000, 32000, 2, 16, 0)
@@ -45,6 +51,8 @@ def capture_endpoint(kind, seconds, stop, on_audio):
         started = True
         began = last_audio = time.monotonic()
         while not stop.is_set():
+            if watcher:
+                watcher.check()
             now = time.monotonic()
             if seconds is not None and now - began >= seconds:
                 break
@@ -91,6 +99,10 @@ def capture_endpoint(kind, seconds, stop, on_audio):
             stop.wait(.01)
         return CaptureResult(b'', 16000, 1, packets, discontinuities,
                              timestamp_errors, time.monotonic() - began, stop.is_set())
+    except OSError:
+        if watcher:
+            watcher.check(force=True)
+        raise
     finally:
         if started:
             method(client, 11, HRESULT)(client)

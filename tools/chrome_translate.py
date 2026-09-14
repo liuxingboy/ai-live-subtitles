@@ -15,8 +15,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.api_debug import Session, configure_console, connection_config, safe_error, session_config
+from audio.output_device import OutputDeviceChanged
 from audio.sources import SOURCE_REGISTRY, resolve_source, SourceShutdownError
-from app.preferences import SPEED_MODES, TARGET_LANGUAGES
+from app.preferences import SPEED_MODES, TARGET_LANGUAGES, add_hotword_arguments
 from tools.reconnect import ConnectionLost, network_error, run_with_reconnect
 
 
@@ -148,8 +149,7 @@ def main(argv=None, stop_event=None, on_event=None, on_state=None):
     parser.add_argument('--seconds', type=float, help='限时运行秒数（包括重连等待）；默认到 Ctrl+C')
     parser.add_argument('--silence-seconds', type=float, default=30, help='静音多久暂停云端，默认 30 秒；0 禁用')
     parser.add_argument('--silence-db', type=float, default=-55, help='静音阈值 dBFS，默认 -55')
-    parser.add_argument('--hotwords', type=Path, default=ROOT / 'config/hotwords/python.json', help='术语 JSON 路径（默认 Python 教学词库）')
-    parser.add_argument('--no-hotwords', action='store_true', help='关闭术语词库')
+    add_hotword_arguments(parser)
     display = parser.add_mutually_exclusive_group()
     display.add_argument('--partial', action='store_true', help='终端也打印流式临时结果（悬浮窗默认已显示）')
     display.add_argument('--final-only', action='store_true', help='悬浮窗仅显示最终结果，更稳定但等待更久')
@@ -175,9 +175,10 @@ def main(argv=None, stop_event=None, on_event=None, on_state=None):
         from dotenv import load_dotenv
         load_dotenv(ROOT / '.env', encoding='utf-8-sig')
         from app.preferences import load_hotwords
+        hotwords_requested = args.hotwords is not None and not args.no_hotwords
         args.hotwords = load_hotwords(None if args.no_hotwords or args.target_language != 'zh' else args.hotwords)
         print(f'[INFO] 已加载 {len(args.hotwords)} 条术语；静音暂停阈值 {args.silence_seconds:g} 秒。', flush=True)
-        if args.target_language != 'zh' and not args.no_hotwords:
+        if args.target_language != 'zh' and hotwords_requested:
             print('[INFO] 非中文目标暂不应用中译热词，词库文件保留。', flush=True)
         key, url = connection_config(os.environ)
         target = resolve_source(args.source, args.pid)
@@ -196,9 +197,9 @@ def main(argv=None, stop_event=None, on_event=None, on_state=None):
                     run_idle_attempt(target, key, url, args, remaining, stop, report)
                 else:
                     run_attempt(target, key, url, args, remaining, stop, report)
-            except ConnectionLost as exc:
+            except (ConnectionLost, OutputDeviceChanged) as exc:
                 if on_state:
-                    on_state('reconnecting', '连接中断 · 自动重连中')
+                    on_state('reconnecting', '播放设备变化 · 恢复采集中' if isinstance(exc, OutputDeviceChanged) else '连接中断 · 自动重连中')
                 raise type(exc)(safe_error(exc, key)) from None
         run_with_reconnect(attempt, stop, report, args.seconds, alive=target.alive)
     except Exception as exc:

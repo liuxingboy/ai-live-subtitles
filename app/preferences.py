@@ -40,3 +40,21 @@ def load_hotwords(path):
     if not isinstance(value, dict) or not all(isinstance(k, str) and k.strip() and isinstance(v, str) and v.strip() for k, v in value.items()):
         raise ValueError('术语词库必须是非空字符串到非空字符串的 JSON 映射。')
     return value
+
+
+HOTWORD_DIRECTORY = ROOT / 'config' / 'hotwords'
+DEFAULT_HOTWORDS = HOTWORD_DIRECTORY / 'python.json'
+
+
+def discover_hotwords(directory=HOTWORD_DIRECTORY):
+    """Discover files without loading their contents; validate only before use."""
+    labels = {'python': 'Python 教学', 'cs2': 'CS2 电竞'}
+    files = sorted((p for p in Path(directory).glob('*.json') if p.is_file()),
+                   key=lambda p: (p.stem != 'python', p.stem != 'cs2', p.name.casefold()))
+    return {str(p.resolve()): labels.get(p.stem, p.stem) for p in files}
+
+
+def add_hotword_arguments(parser):
+    parser.add_argument('--hotwords', type=Path, default=None,
+                        help='启用并指定术语 JSON；省略时默认关闭热词')
+    parser.add_argument('--no-hotwords', action='store_true', help='关闭术语词库，优先于 --hotwords')

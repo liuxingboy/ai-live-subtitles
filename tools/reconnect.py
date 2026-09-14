@@ -2,6 +2,7 @@
 import time
 import json
 import re
+from audio.output_device import OutputDeviceChanged
 
 
 class ConnectionLost(RuntimeError):
@@ -28,6 +29,13 @@ def service_error(detail):
         and re.search(r'\bstatusCode\s*=\s*504\b', message, re.IGNORECASE)
         and 'response stream timeout' in message.lower()
     )
+    # ASR may wrap upstream capacity errors inside UNEXPECTED_ASR_ERROR.
+    # Match the observed capacity diagnostic, not every ASR/429 failure.
+    asr_capacity = (
+        code == 'unexpected_asr_error'
+        and re.search(r'\bstatusCode\s*=\s*429\b', message, re.IGNORECASE)
+        and re.search(r'\bthread\s+pool\s+(?:exausted|exhausted)\b', message, re.IGNORECASE)
+    )
     # Observed model repetition failure: start a fresh session to recover.
     model_repetition = (
         code == 'common_error'
@@ -40,7 +48,7 @@ def service_error(detail):
         and set(detail) <= {'type', 'code', 'message'}
     )
     error_type = (UnspecifiedASRError if unspecified_asr else
-                  ConnectionLost if retryable or asr_timeout or model_repetition else ServiceError)
+                  ConnectionLost if retryable or asr_timeout or asr_capacity or model_repetition else ServiceError)
     return error_type(json.dumps(detail, ensure_ascii=False))
 
 
@@ -57,6 +65,7 @@ def run_with_reconnect(operation, stop, report, seconds=None, alive=lambda: True
     deadline = clock() + seconds if seconds is not None else None
     failures = 0
     asr_recoveries = 0
+    device_failures = 0
     while not stop.is_set():
         remaining = None if deadline is None else deadline - clock()
         if remaining is not None and remaining <= 0:
@@ -67,6 +76,22 @@ def run_with_reconnect(operation, stop, report, seconds=None, alive=lambda: True
         try:
             operation(remaining)
             return
+        except OutputDeviceChanged as exc:
+            report['output_device_changes'] = report.get('output_device_changes', 0) + 1
+            if stop.is_set():
+                return
+            if clock() - began >= 30:
+                device_failures = 0
+            device_failures += 1
+            if device_failures > 5:
+                raise RuntimeError('播放设备持续变化或不可用，请检查 Windows 声音设置后重试') from exc
+            delay = 1 if deadline is None else min(1, max(0, deadline - clock()))
+            print(f'[AUDIO] {exc}；等待设备稳定后重新采集。', flush=True)
+            if delay <= 0 or stop.wait(delay):
+                return
+            if deadline is not None and clock() >= deadline:
+                return
+            report['output_device_recovery_attempts'] = report.get('output_device_recovery_attempts', 0) + 1
         except ConnectionLost as exc:
             report['disconnects'] = report.get('disconnects', 0) + 1
             if stop.is_set():

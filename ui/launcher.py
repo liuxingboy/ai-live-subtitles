@@ -79,6 +79,31 @@ def run(argv=None, demo=False):
         if controller.select_language(key):
             window.running = True
         tray.select_language(controller.target_language)
+        sync_hotwords()
+
+    def sync_hotwords():
+        tray.set_hotwords_state(controller.hotwords_enabled, controller.hotwords_path,
+                               applicable=controller.target_language == 'zh',
+                               available=not demo and not window.stopping and not controller.blocked)
+
+    def change_hotwords(*, enabled=None, path=None):
+        if window.stopping or demo:
+            return
+        try:
+            if controller.set_hotwords(enabled=enabled, path=path):
+                if controller.pending is not None or (controller.thread and controller.thread.is_alive()):
+                    window.running = True
+        except (OSError, ValueError) as exc:
+            name = Path(path if path is not None else controller.hotwords_path).name
+            message = f'{name} 无法加载（{type(exc).__name__}），请检查 JSON 字符串映射格式。原热词设置保留。'
+            print(f'[WARN] {message}', flush=True)
+            tray.showMessage('热词加载失败', message, tray.MessageIcon.Warning)
+        sync_hotwords()
+
+    tray.hotwords_toggled.connect(lambda enabled: change_hotwords(enabled=enabled))
+    tray.hotword_selected.connect(lambda path: change_hotwords(path=path))
+    tray.menu.aboutToShow.connect(sync_hotwords)
+    sync_hotwords()
 
     def sync_lock_state():
         tray.set_lock_state(window.locked, window.lock_available and not window.stopping,
@@ -109,6 +134,7 @@ def run(argv=None, demo=False):
             tray.source_menu.setEnabled(False)
             tray.speed_menu.setEnabled(False)
             tray.language_menu.setEnabled(False)
+            sync_hotwords()
         with lock:
             texts = manager.snapshot()
             status = tuple(state)

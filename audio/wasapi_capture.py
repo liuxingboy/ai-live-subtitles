@@ -177,7 +177,7 @@ class CaptureResult:
     interrupted: bool
 
 
-def capture_process(pid, seconds=10, stop=None, alive=None, progress=None, on_audio=None):
+def capture_process(pid, seconds=10, stop=None, alive=None, progress=None, on_audio=None, monitor_output=False):
     """Capture 16 kHz mono PCM16; WASAPI performs stateful format conversion."""
     if sys.getwindowsversion().build < 20348:
         raise RuntimeError("按进程捕获要求 Windows build 20348 或更高。")
@@ -186,6 +186,7 @@ def capture_process(pid, seconds=10, stop=None, alive=None, progress=None, on_au
     if seconds is None and on_audio is None:
         raise ValueError("无限时捕获必须提供流式音频回调。")
     check(ole32.CoInitializeEx(None, 0), "初始化 COM MTA")
+    watcher = None
     completion = client = capture = handle = None
     started = False
     rate, channels = 16000, 1
@@ -196,6 +197,9 @@ def capture_process(pid, seconds=10, stop=None, alive=None, progress=None, on_au
     packets = discontinuities = timestamp_errors = 0
     interrupted = False
     try:
+        if monitor_output:
+            from audio.output_device import OutputDeviceWatcher
+            watcher = OutputDeviceWatcher()
         completion = Completion(pid)
         client = completion.activate()
         fmt = WaveFormat(1, channels, rate, rate * block_align, block_align, 16, 0)
@@ -220,6 +224,8 @@ def capture_process(pid, seconds=10, stop=None, alive=None, progress=None, on_au
             if stop is not None and stop.is_set():
                 interrupted = True
                 break
+            if watcher:
+                watcher.check()
             if alive is not None and not alive():
                 raise RuntimeError("目标 Chrome 已退出或 PID 已变化，请重新运行。")
             if time.monotonic() - last_packet > 5:
@@ -269,6 +275,10 @@ def capture_process(pid, seconds=10, stop=None, alive=None, progress=None, on_au
                     break
         return CaptureResult(bytes(output), rate, channels, packets, discontinuities,
                              timestamp_errors, time.monotonic() - start, interrupted)
+    except OSError:
+        if watcher:
+            watcher.check(force=True)
+        raise
     finally:
         if started:
             method(client, 11, HRESULT)(client)

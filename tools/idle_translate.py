@@ -21,6 +21,8 @@ def run_idle_attempt(target, key, url, args, seconds, stop, report):
     last_dropped = 0
     report['normal_finish'] = True  # Idle without a cloud session is a valid exit.
 
+    attempt_failed = False
+
     def state(kind, text):
         print(f'[{kind.upper()}] {text}', flush=True)
         if args.on_state:
@@ -31,7 +33,10 @@ def run_idle_attempt(target, key, url, args, seconds, stop, report):
         current = session
         try:
             if current and graceful:
-                current.finish()
+                try:
+                    current.finish()
+                except (OSError, websocket.WebSocketException, TimeoutError) as exc:
+                    raise network_error(exc) from exc
                 report['normal_finish'] = True
         finally:
             if current:
@@ -123,12 +128,16 @@ def run_idle_attempt(target, key, url, args, seconds, stop, report):
                 print(f"[STATUS] 已发送 {report.get('uploaded_seconds', 0)}s，云端{'运行中' if session else '暂停'}，"
                       f"静音暂停 {report.get('silence_pauses', 0)} 次，重连 {report.get('reconnect_attempts', 0)} 次", flush=True)
         close_session(True)
+    except BaseException:
+        attempt_failed = True
+        raise
     finally:
         source.stop.set()
         source.thread.join(timeout=17)
-        # A failed connection must not be labelled as graceful completion.
+        # Preserve the primary failure. A send timeout does not necessarily set
+        # session.failed (the reader flag); never write session.finish after it.
         try:
-            if session and not session.failed.is_set():
+            if session and not attempt_failed and not session.failed.is_set():
                 close_session(True)
             else:
                 close_session(False)
