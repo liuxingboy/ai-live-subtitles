@@ -1,4 +1,4 @@
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QTextLayout, QTextOption
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton, QSizeGrip, QMenu, QApplication
 
@@ -6,11 +6,12 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton, QSizeGr
 class Overlay(QWidget):
     stop_requested = Signal()
     settings_changed = Signal()
+    minimized_changed = Signal(bool)
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle('实时双语字幕')
-        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.WindowMinimizeButtonHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setMinimumWidth(420)
         self._drag = None
@@ -22,7 +23,7 @@ class Overlay(QWidget):
         self.shortcut_prefix = 'Ctrl+Alt'
         self.setStyleSheet('QLabel { color: #171b20; background: transparent; } QPushButton { color: #252a31; background: rgba(219, 225, 232, 190); border: none; border-radius: 5px; padding: 4px 10px; } QPushButton:hover { background: #cbd4de; }')
         self.content_layout = QVBoxLayout(self)
-        self.content_layout.setContentsMargins(16, 10, 36, 10)
+        self.content_layout.setContentsMargins(16, 10, 62, 10)
         self.content_layout.setSpacing(6)
         self.status = QLabel('正在启动…')
         self.status.setTextFormat(Qt.TextFormat.PlainText)
@@ -35,6 +36,12 @@ class Overlay(QWidget):
         self.close_button.setFixedSize(22, 22)
         self.close_button.setStyleSheet('QPushButton { color: #606773; background: transparent; border: none; padding: 0; font-size: 18px; } QPushButton:hover { color: #222; background: #d9dfe5; border-radius: 4px; }')
         self.close_button.clicked.connect(self.close)
+        self.minimize_button = QPushButton('−', self)
+        self.minimize_button.setToolTip('最小化并暂停同声翻译；恢复窗口后继续')
+        self.minimize_button.setAccessibleName('最小化并暂停')
+        self.minimize_button.setFixedSize(22, 22)
+        self.minimize_button.setStyleSheet(self.close_button.styleSheet())
+        self.minimize_button.clicked.connect(self.showMinimized)
         self.source = QLabel()
         self.translation = QLabel()
         for label, pixels in ((self.source, 18), (self.translation, 24)):
@@ -67,7 +74,7 @@ class Overlay(QWidget):
             line = layout.createLine()
             if not line.isValid():
                 break
-            line.setLineWidth(max(100, self.width() - 56))
+            line.setLineWidth(max(100, self.width() - 82))
             lines.append(text[line.textStart():line.textStart() + line.textLength()])
         layout.endLayout()
         return ('…' if len(lines) > 3 else '') + '\n'.join(lines[-3:])
@@ -107,6 +114,7 @@ class Overlay(QWidget):
         super().resizeEvent(event)
         if hasattr(self, 'grip'):
             self.close_button.move(self.width() - 28, 4)
+            self.minimize_button.move(self.width() - 54, 4)
             self.grip.move(self.width() - 16, self.height() - 16)
             if event.size().width() != event.oldSize().width():
                 self.show_subtitles(*self._texts)
@@ -117,7 +125,8 @@ class Overlay(QWidget):
         self.settings_changed.emit()
 
     def preferences(self):
-        return dict(x=self.x(), y=self.y(), width=self.width(),
+        geometry = self.normalGeometry() if self.isMinimized() else self.geometry()
+        return dict(x=geometry.x(), y=geometry.y(), width=geometry.width(),
                     source_font=self.source.font().pixelSize(), translation_font=self.translation.font().pixelSize())
 
     def restore_preferences(self, values):
@@ -153,6 +162,7 @@ class Overlay(QWidget):
         self.locked = not self.locked
         self._drag = None
         self.close_button.setVisible(not self.locked)
+        self.minimize_button.setVisible(not self.locked)
         self.grip.setVisible(not self.locked)
         print(f'[INFO] 已锁定并点击穿透，{self.shortcut_prefix}+L 解锁。' if self.locked else '[INFO] 已解锁。', flush=True)
 
@@ -179,12 +189,20 @@ class Overlay(QWidget):
     def mouseReleaseEvent(self, event):
         self._drag = None
 
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            was_minimized = bool(event.oldState() & Qt.WindowState.WindowMinimized)
+            if was_minimized != self.isMinimized():
+                self.minimized_changed.emit(self.isMinimized())
+
     def closeEvent(self, event):
         if self.running:
             event.ignore()
             if not self.stopping:
                 self.stopping = True
                 self.close_button.setEnabled(False)
+                self.minimize_button.setEnabled(False)
                 self.set_status('stopped', '正在结束会话，请稍候…')
                 self.stop_requested.emit()
         else:

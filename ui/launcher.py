@@ -1,5 +1,6 @@
 """Qt stays on the main thread; a bounded mailbox carries worker updates."""
 import signal
+import sys
 import threading
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
@@ -9,6 +10,11 @@ from ui.overlay import Overlay
 
 def run(argv=None, demo=False):
     from tools.chrome_translate import main as translate
+    if sys.platform == 'win32':
+        import ctypes
+        # Set before creating any windows so the taskbar uses our icon, not Python's.
+        ctypes.OleDLL('shell32').SetCurrentProcessExplicitAppUserModelID(
+            ctypes.c_wchar_p('LiveSubtitles.Desktop'))
     app = QApplication.instance() or QApplication([])
     from pathlib import Path
     from PySide6.QtGui import QIcon
@@ -53,6 +59,12 @@ def run(argv=None, demo=False):
     options = source_parser.parse_known_args(argv or [])[0]
     initial_source = options.source
     controller = TranslationController(translate, argv, event_received, status_changed, speed=options.speed, target_language=options.target_language)
+    def minimize_changed(minimized):
+        if demo or window.stopping:
+            return
+        if controller.set_suspended(minimized) and not minimized:
+            window.running = True
+    window.minimized_changed.connect(minimize_changed)
     tray = SubtitleTray(app.windowIcon(), initial_source, window)
     tray.select_speed(options.speed)
     tray.select_language(options.target_language)
@@ -127,6 +139,9 @@ def run(argv=None, demo=False):
     else:
         print('[WARN] 系统托盘不可用；可用 --source 参数选择声源。', flush=True)
 
+    from app.screenshot_controller import ScreenshotController
+    screenshots = ScreenshotController(app, tray, window, lambda: controller.target_language)
+
     last = [None]
     def refresh():
         controller.poll()
@@ -149,6 +164,8 @@ def run(argv=None, demo=False):
             window.running = False
             if window.stopping:
                 window.close()
+            elif controller.suspended:
+                pass  # Keep the paused/error status while minimized.
             elif controller.result == 0:
                 window.set_status('stopped', '会话已结束 · 可关闭窗口')
             elif status[0] != 'error':
@@ -184,6 +201,7 @@ def run(argv=None, demo=False):
     try:
         app.exec()
     finally:
+        screenshots.shutdown()
         controller.close()
         timer.stop()
         tray.shutdown()

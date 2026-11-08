@@ -15,6 +15,10 @@ class SubtitleTray(QSystemTrayIcon):
     hotword_selected = Signal(str)
     lock_requested = Signal()
     exit_requested = Signal()
+    screenshot_region_requested = Signal()
+    screenshot_full_requested = Signal()
+    screenshot_context_requested = Signal()
+    screenshot_shortcuts_requested = Signal()
 
     def __init__(self, icon, selected='chrome', parent=None):
         super().__init__(icon, parent)
@@ -69,6 +73,15 @@ class SubtitleTray(QSystemTrayIcon):
         for path, label in discover_hotwords().items():
             self._add_hotword_action(path, label)
         self.hotword_group.triggered.connect(lambda action: self.hotword_selected.emit(action.data()))
+        self.screenshot_menu = self.menu.addMenu('截图翻译')
+        self.screenshot_region_action = self.screenshot_menu.addAction(
+            '框选截图翻译\tCtrl+Alt+F1', self.screenshot_region_requested.emit)
+        self.screenshot_full_action = self.screenshot_menu.addAction(
+            '全屏截图翻译（鼠标所在屏幕）', self.screenshot_full_requested.emit)
+        self.screenshot_menu.addSeparator()
+        self.screenshot_context_action = self.screenshot_menu.addAction(
+            '编辑背景说明…', self.screenshot_context_requested.emit)
+        self.screenshot_menu.addAction('设置截图快捷键…', self.screenshot_shortcuts_requested.emit)
         self.menu.addSeparator()
         self.lock_action = self.menu.addAction('锁定并点击穿透')
         self.lock_action.setCheckable(True)
@@ -81,6 +94,15 @@ class SubtitleTray(QSystemTrayIcon):
     def select(self, key):
         self.actions[key].setChecked(True)
         self._update_tooltip()
+
+    def set_screenshot_shortcuts(self, shortcuts, errors):
+        for mode, action, label in (
+            ('region', self.screenshot_region_action, '框选截图翻译'),
+            ('full', self.screenshot_full_action, '全屏截图翻译（鼠标所在屏幕）'),
+        ):
+            suffix = '（快捷键不可用）' if mode in errors else ''
+            action.setText(f'{label}{suffix}\t{shortcuts[mode]}')
+            action.setToolTip(errors.get(mode, '全局快捷键，可在“设置截图快捷键”中修改'))
 
     def select_speed(self, key):
         self.speed_actions[key].setChecked(True)

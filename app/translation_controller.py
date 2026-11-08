@@ -31,6 +31,7 @@ class TranslationController:
         self.generation = 0
         self.closing = False
         self.blocked = False
+        self.suspended = False
 
     def select(self, key, *, force=False):
         if key not in SOURCE_REGISTRY or self.closing or self.blocked:
@@ -41,7 +42,10 @@ class TranslationController:
         self.generation += 1  # suppress late callbacks from the old session
         self.stop.set()
         self.on_event({'type': '_session_reset'})
-        self.on_state('switching', f'正在切换到{SOURCE_REGISTRY[key][0]} · {SPEED_MODES[self.speed]} · {TARGET_LANGUAGES[self.target_language]}…')
+        if self.suspended:
+            self.on_state('paused', '已最小化 · 同声翻译暂停，恢复窗口后继续')
+        else:
+            self.on_state('switching', f'正在切换到{SOURCE_REGISTRY[key][0]} · {SPEED_MODES[self.speed]} · {TARGET_LANGUAGES[self.target_language]}…')
         self.poll()
         return True
 
@@ -86,7 +90,7 @@ class TranslationController:
             self.blocked = True
             self.pending = None
             self.on_state('error', '旧音频采集未能退出，请退出并重启程序')
-        if self.pending is None or self.closing or self.blocked:
+        if self.pending is None or self.closing or self.blocked or self.suspended:
             return
         key, self.pending = self.pending, None
         self.stop = threading.Event()
@@ -135,6 +139,19 @@ class TranslationController:
                 self.done.set()
         self.thread = threading.Thread(target=worker, name='translation-worker')
         self.thread.start()
+
+    def set_suspended(self, suspended):
+        if self.closing or self.blocked or self.suspended == suspended:
+            return False
+        self.suspended = suspended
+        if suspended:
+            self.pending = None
+            self.generation += 1
+            self.stop.set()
+            self.on_event({'type': '_session_reset'})
+            self.on_state('paused', '已最小化 · 同声翻译暂停，恢复窗口后继续')
+            return True
+        return self.select(self.selected, force=True)
 
     def close(self):
         self.closing = True

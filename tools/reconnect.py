@@ -13,6 +13,10 @@ class UnspecifiedASRError(ConnectionLost):
     """Observed ASR failure without diagnostics; recovery has a strict budget."""
 
 
+class ContentInspectionError(ConnectionLost):
+    """Skip rejected content and resume future audio with a bounded recovery budget."""
+
+
 class ServiceError(RuntimeError):
     pass
 
@@ -21,6 +25,8 @@ def service_error(detail):
     """Classify server events; unknown ASR errors remain terminal by default."""
     code = str(detail.get('code', '')).lower()
     message = str(detail.get('message', ''))
+    if code == 'data_inspection_failed':
+        return ContentInspectionError('云端内容审核未通过，本次片段无法翻译（data_inspection_failed）')
     retryable = code in ('server_error', 'rate_limit_exceeded', 'session_expired', 'session_timeout')
     # Observed after paused playback: ASR's upstream response stream times out,
     # even though WebSocket ping/pong and audio uploads are still functioning.
@@ -65,6 +71,7 @@ def run_with_reconnect(operation, stop, report, seconds=None, alive=lambda: True
     deadline = clock() + seconds if seconds is not None else None
     failures = 0
     asr_recoveries = 0
+    inspection_recoveries = 0
     device_failures = 0
     while not stop.is_set():
         remaining = None if deadline is None else deadline - clock()
@@ -96,6 +103,8 @@ def run_with_reconnect(operation, stop, report, seconds=None, alive=lambda: True
             report['disconnects'] = report.get('disconnects', 0) + 1
             if stop.is_set():
                 return
+            if isinstance(exc, ContentInspectionError) and inspection_recoveries >= 2:
+                raise ServiceError('云端内容审核未通过，自动恢复两次后仍失败；请切换播放内容后重新启动翻译。') from exc
             if isinstance(exc, UnspecifiedASRError) and asr_recoveries >= 2:
                 raise ServiceError('云端语音识别错误未提供原因，自动恢复两次后仍失败。可尝试正常模式；若仍失败请稍后重试。') from exc
             if clock() - began >= 30:
@@ -111,6 +120,9 @@ def run_with_reconnect(operation, stop, report, seconds=None, alive=lambda: True
                 return
             if deadline is not None and clock() >= deadline:
                 return
+            if isinstance(exc, ContentInspectionError):
+                inspection_recoveries += 1
+                report['content_inspection_recovery_attempts'] = inspection_recoveries
             if isinstance(exc, UnspecifiedASRError):
                 asr_recoveries += 1
                 report['asr_recovery_attempts'] = asr_recoveries

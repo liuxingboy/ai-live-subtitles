@@ -53,3 +53,43 @@ class Hotkeys(QAbstractNativeEventFilter):
         for index in self.actions:
             user32.UnregisterHotKey(None, index)
         self.actions.clear()
+
+
+class ScreenshotHotkey(QAbstractNativeEventFilter):
+    """Register independent configurable shortcuts and report conflicts per action."""
+    ID = 0x5240
+
+    def __init__(self, app, actions, shortcuts):
+        super().__init__()
+        from app.screenshot_translation import validate_shortcuts
+        shortcuts = validate_shortcuts(shortcuts)
+        self.app = app
+        self.actions, self.errors = {}, {}
+        for offset, mode in enumerate(('region', 'full')):
+            sequence = shortcuts[mode]
+            parts = sequence.split('+')
+            modifiers = 0x4000
+            for modifier in parts[:-1]:
+                modifiers |= {'Ctrl': 2, 'Alt': 1, 'Shift': 4, 'Win': 8}[modifier]
+            key = parts[-1]
+            virtual_key = 0x70 + int(key[1:]) - 1 if len(key) > 1 else ord(key)
+            index = self.ID + offset
+            if user32.RegisterHotKey(None, index, modifiers, virtual_key):
+                self.actions[index] = actions[mode]
+            else:
+                error = C.get_last_error()
+                self.errors[mode] = f'{sequence} 注册失败（Windows {error}），可能被其他程序占用。'
+        app.installNativeEventFilter(self)
+
+    def nativeEventFilter(self, event_type, message):
+        msg = W.MSG.from_address(int(message))
+        if msg.message == 0x312 and msg.wParam in self.actions:
+            self.actions[msg.wParam]()
+            return True, 0
+        return False, 0
+
+    def close(self):
+        self.app.removeNativeEventFilter(self)
+        for index in self.actions:
+            user32.UnregisterHotKey(None, index)
+        self.actions.clear()

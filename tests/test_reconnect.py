@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import Mock
 import websocket
 from tools.api_debug import Session
-from tools.reconnect import ConnectionLost, UnspecifiedASRError, ServiceError, network_error, service_error, run_with_reconnect
+from tools.reconnect import ContentInspectionError, ConnectionLost, UnspecifiedASRError, ServiceError, network_error, service_error, run_with_reconnect
 
 
 class FakeStop:
@@ -23,6 +23,55 @@ class FakeStop:
 
 
 class ReconnectTests(unittest.TestCase):
+    def test_content_inspection_event_recovers_for_future_audio(self):
+        detail = {'type': 'invalid_request_error', 'code': 'data_inspection_failed',
+                  'message': 'Output data may contain inappropriate content.'}
+        ws = Mock()
+        ws.recv_data.return_value = (websocket.ABNF.OPCODE_TEXT,
+                                     json.dumps({'type': 'error', 'error': detail}))
+        session = Session(ws, '')
+        session.receive()
+        self.assertTrue(session.failed.is_set())
+        self.assertIsInstance(session.failure, ContentInspectionError)
+        self.assertIn('内容审核', str(session.failure))
+        self.assertNotIn('invalid_request_error', str(session.failure))
+        stop, report = FakeStop(), {}
+        operation = Mock(side_effect=[session.failure, None])
+        run_with_reconnect(operation, stop, report, clock=lambda: stop.now)
+        self.assertEqual(operation.call_count, 2)
+        self.assertEqual(stop.delays, [1])
+        self.assertEqual(report['content_inspection_recovery_attempts'], 1)
+
+    def test_content_inspection_budget_does_not_reset_after_long_attempt(self):
+        stop, report = FakeStop(), {}
+        def fail(_):
+            stop.now += 31
+            raise service_error({'code': 'data_inspection_failed'})
+        operation = Mock(side_effect=fail)
+        with self.assertRaisesRegex(ServiceError, '内容审核.*两次'):
+            run_with_reconnect(operation, stop, report, clock=lambda: stop.now)
+        self.assertEqual(operation.call_count, 3)
+        self.assertEqual(report['content_inspection_recovery_attempts'], 2)
+        self.assertEqual(len(stop.delays), 2)
+
+    def test_content_inspection_cancel_does_not_reconnect(self):
+        stop, report = FakeStop(), {}
+        def fail(_):
+            stop.stopped = True
+            raise service_error({'code': 'data_inspection_failed'})
+        run_with_reconnect(fail, stop, report, clock=lambda: stop.now)
+        self.assertEqual(stop.delays, [])
+        self.assertNotIn('content_inspection_recovery_attempts', report)
+
+    def test_other_invalid_requests_still_stop(self):
+        error = service_error({'type': 'invalid_request_error', 'code': 'invalid_api_key',
+                               'message': 'Output data may contain inappropriate content.'})
+        self.assertIsInstance(error, ServiceError)
+        stop = FakeStop()
+        with self.assertRaises(ServiceError):
+            run_with_reconnect(Mock(side_effect=error), stop, {})
+        self.assertEqual(stop.delays, [])
+
     def test_paused_playback_asr_timeout_reconnects(self):
         detail = {
             'type': 'transcription_error', 'code': 'UNEXPECTED_ASR_ERROR',
